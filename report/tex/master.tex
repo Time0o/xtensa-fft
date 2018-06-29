@@ -1,0 +1,388 @@
+\RequirePackage[ngerman=ngerman-x-latest]{hyphsubst}
+
+\documentclass[ngerman, cd=lightcolor]{tudscrreprt}
+
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage[outputdir=aux]{minted}
+\usepackage{tablefootnote}
+
+\setlength{\footnotesep}{\baselineskip}
+\setminted{%
+  frame=single,
+  fontsize=\scriptsize,
+  labelposition=none,
+  linenos=true
+}
+
+\begin{document}
+
+\chair{Vodafone Chair for Mobile Communications Systems}
+
+\title{%
+  Lab Report HW/SW-Codesign \\
+  Winter Semester 17/18
+}
+\author{%
+  Timo Nicolai
+}
+
+\headingsvskip=-100pt
+
+\date{}
+\maketitle
+\tableofcontents
+
+\chapter{Introduction}
+
+This report describes an implementation of the Cooley-Tukey FFT algorithm for
+one of Tensilica's Xtensa processor platforms. The Tensilica Instruction
+Extension hardware-description DSL is utilized to customize the core Xtensa
+core architecture by means of additional specialized registers and instructions
+which make it possible to perform the specialized task of computing a DIT/DIF
+FFT at significantly higher speeds than would ordinarily be possible with the
+base ISA alone.
+
+Simulation shows that the resulting microprocessor architecture can achieve more
+than twenty times the throughput for FFT computations over a sufficiently large
+number of input points. A manufactured Xtensa processor using these extensions
+would approximately consume twice as much area as compared to an unmodified one.
+
+The algorithm itself is implemented in assembly in the file fsm.S,
+the instruction set extensions are implemented in the fft.tie file
+in the aforementioned TIE language. While the code itself is short, a significant
+amount of thought has gone into this project to squeeze every last bit of
+performance out of the implementation (whenever the throughput / area tradeoff
+was reasonable). Most advanced features of the Xtensa ISA and the TIE language
+have been utilized as described in the following sections.
+
+\chapter{Overview}
+
+\section{Utilized Techniques}
+
+23 new instructions where generated, of which the most performance critical,
+BFLY\_DIT/DIF\_MAIN is also by far the most area consuming (over 30.000 gates vs.
+about 2300 gates for the second most area consuming operation).
+
+While the structure of the reference implementation was kept mainly intact,
+the whole final program was hand-written in assembly. Also, the first three (or
+last three in case of DIF) iterations of the main butterfly loop where unrolled
+because they require special treatment and the structure of the innermost
+loop was changed slightly to allow parallel processing of eight complex values
+in one iteration.
+
+Similarly structured C code was initially also developed so that it’s optimized
+assembly could be consulted as a reference. In the end this code was
+completely disposed of because even with significant effort, the compiler
+could not compete with the hand-written assembly.
+
+The following is a summary of the techniques that were utilized to achieve an
+increase in throughput.
+
+\begin{description}
+\item[SIMD]:
+
+The number of cycles in which a certain amount of values can be loaded
+from/stored to memory constitutes a bottleneck in multiple parts of the
+algorithm (especially the main butterfly operations). 128 bit SIMD processor
+states (states because the main butterfly operation needs to operate on eight
+128 bit registers at once (inputs + outputs) which is not possible with user
+registers) make it possible to alleviate this by loading eight 16 bit values
+with one instruction.
+
+\item[FLIX]:
+
+FLIX improves this last measure even further by making it possible to load 2
+times 128 bit with a single VLIW instruction.
+
+Also, multiple other operations can be performed simultaneously this way, e.g.
+increasing a loop counter of performing a branch in parallel with two
+load/store operations without additional hardware overhead.
+
+\item[Internal Pipelining]:
+
+The program’s most complex TIE operation which performs eight butterfly
+operations, including twiddle factor calculation, in parallel, was internally
+pipelined by scheduling it’s results one cycle in the future. If the circuit
+was to be synthesized, this would shorten the operation’s critical path,
+possibly allowing the system to operate at a higher clock frequency.
+
+Also, software pipelining was utilized in several places, especially when
+performing the butterfly operations. A set of separate TIE load and store
+buffers was necessary in order to make this possible.
+
+\item[Hardware Lookup]:
+
+The sine wave table needed for twiddle calculation was implemented as a
+hardware lookup table, both to avoid taking up RAM unnecessarily and to reduce
+the need for performance limiting memory accesses.
+
+\item[Hand-coded Assembly]:
+
+Especially when working with optimizations, the compiler often produced
+undesirable results by e.g. optimizing away seemingly unused pointers which
+might be essential in order for some TIE operation to function correctly or by
+producing functional but suboptimal solutions.
+
+In addition, any modern compiler will struggle with producing highly optimized
+VLIW code. Since FLIX can potentially provide a large performance gain, this
+would have been a problem.
+
+Because of this last point, inline assembly would have been necessary for
+critical parts of the program in any case. This would clutter up the code and
+make it less readable. In contrast, the final assembly code is reasonably short
+while also remaining easily understandable.
+\end{description}
+
+\section{Accelerated Sections of the Algorithm}
+
+\begin{description}
+\item[DIT/DIF]:
+
+The more the butterfly operations where optimized, the more decimation in
+time contributed to the total execution time because parts of it can not be
+realized with SIMD memory accesses. Still, a vast improvement over the
+reference implementation was possible, mainly because dynamic bit-reversal
+is a rather complicated operation without dedicated hardware. Here it is
+realized with a bit-reverse ripple carry adder.
+
+\item[Scaling]:
+
+Whether scaling is necessary in each loop iteration is determined by
+repeatedly loading multiple input values into SIMD registers, calculating
+their absolute value in hardware and then checking whether their second
+most significant bit remains set, in which case shifts need to be applied later
+on (This applies only for the inverse FFT).
+
+\item[Twiddle-Factor Computation]:
+
+This could be easily realized with little more than a hardware lookup table,
+which eliminated the need to store the same information in (limited) RAM and
+also made it possible to directly calculate twiddle factors from within a
+butterfly operation, saving additional cycles, the hardware table’s size was
+kept small with the help of some bit twiddling tricks in a function used to
+access it.
+
+\item[Butterfly Operations]:
+
+The butterfly operations are the part of the FFT that could benefit the most
+from parallelization so it made sense to implement them in hardware. The first
+three loop iterations (or the last three if DIF is used) repeatedly perform
+four butterfly operations in parallel with one operation while the main inner
+loop performs eight butterfly operations in one instruction.
+\end{description}
+
+\chapter{Execution Time and Area Impact}
+
+\section{Speedup}
+Comparison between C reference implementation and the asm/tie implementation:
+
+\begin{table}[htbp]
+  \begin{tabular}{| l | l | l | l |}
+    \hline
+N &
+
+Cycles\tablefootnote{Sum of cycles needed for
+non-inverse and inverse FFT for different problem sizes, code was compiled with
+O2 flag. Value in brackets refers to DIF.} (C) &
+
+Cycles (asm/tie)\tablefootnote{Same cycle metric. The IDE was not capable of
+giving overall cycle numbers for functions implemented in assembly, the numbers
+here are the approximate total sums of cycles reported for each labelled
+section within the asm code. Performance differences between DIT/DIF were
+insignificantly small and thus only one value is given.} &
+
+Speedup\tablefootnote{Rounded, Value in brackets refers to DIF.} \\
+
+    \hline
+    32   & 11,270 (11,890)   & $\approx$670     & $\approx$16.8 (17.7) \\
+    \hline
+    256  & 119,084 (127,624) & $\approx$4,900a  & $\approx$24.3 (26.0) \\
+    \hline
+    1024 & 563,642 (600,143) & $\approx$21,600  & $\approx$26.0 (27.8) \\
+    \hline
+  \end{tabular}
+\end{table}
+
+From this comparison it can be seen that the gains in terms of speed are
+significantly larger for large values of N and also larger for DIF (because the
+C DIF implementation is slower than the respective C DIT implementation while
+the asm/tie DIF implementation is as fast as it’s DIT counterpart (give or take
+less than 100 cycles)).
+
+\section{Area}
+
+\begin{itemize}
+\item
+Xtensa configuration without TIE: $\approx$93,000 gates.
+
+\item
+Xtensa configuration TIE only: $\approx$175,200 gates, area overhead is
+$\approx$188.4\%.
+
+\item
+Xtensa configuration TIE only, DIT or DIF only\footnote{Meaning that only
+hardware components needed for one approach are added to the hardware.}:
+$\approx$126,100 gates, area overhead is $\approx$135.6\%.
+\end{itemize}
+
+The hardware components needed for the butterfly computations are responsible
+for most of the area increase ($\approx$49.000 gates each for DIT and DIF) with
+DIT/DIF and scaling a distant second (less than 3000 gates each).
+
+It can be seen that the are overhead is significant with the total area more
+than doubling when TIE operations are used. In an actual implementation a
+tradeoff would have to be made, a processing speed increase of more than 250%
+might not be desirable if a slower implementation can save valuable chip area
+instead.
+
+\chapter{Detailed Breakdown}
+
+The first part of the algorithm that was optimized was the decimation in time,
+i.e.  the initial reordering of elements in the input arrays. The first
+important realisation here was that memory accesses create a lower bound on the
+minimum cycle count of this (as well as all following) operation. Using 128 bit
+processor states as well as the two parallel memory accesses per cycle made
+possible by FLIX, at most eight 32 bit complex numbers (i.e. 8 x 16 bit real
+and 8 x 16 bit imaginary numbers). can be loaded/stored per cycle.
+
+Thus the strategy used for efficient decimation in time is to repeatedly load
+eight complex numbers into two load buffers (one storing the real and one
+storing the imaginary parts), and then in 8 x 2 cycles to respectively load one
+complex number from the memory locations defined by the bit-reverse of a
+continuously increasing loop counter value into two additional store buffers
+and then overwriting the values at these memory locations with the
+corresponding complex value from the load buffers (see lines 62-80 (asm)). The
+store buffers are also 128 Bit in size and both load and store buffers are
+shifted by 16 Bits at each of these eight steps so that the next values from
+the load buffers and the next free slots in the store buffers can be easily
+accessed by the following step’s operations. Afterwards, the store buffers
+contents are written to same memory locations from which the load buffers where
+initially populated. This whole procedure is then repeated for a total of N/8
+times (note that N is always divisible by eight if N is greater than or equal
+to eight).  Since memory locations defined by two consecutive bit-reverse
+loop-counter values are in general not adjacent, SIMD loads or stores are out
+of the question in this case. For this reason I believe that the approach
+chosen is close to optimal with regard to clock cycles spent.
+
+One improvement over my initial approach -in which at each step, a bit reversed
+version of the loop counter was obtained through a single hardware operation-
+was to instead construct a reverse ripple-carry adder which made it possible to
+introduce an additional bit-reverse loop-counter which is incremented at each
+step (see lines 384-410 (tie)). This is more efficient, since the inverse of
+some counter value also depends on the problem size N, which makes one-step
+inversion complicated and costly. Speedup was significant and is more or less
+important depending on how heavily the butterfly operations are optimized. e.g.
+for N = 32, decimation in time (or frequency, both operations are equivalent)
+makes up more than 25\% of the total cycle count despite these optimizations
+because the butterflies are implemented with powerful hardware support and thus
+do not dominate the total cycle count completely
+
+At the start of each main loop iteration, it is determined whether scaling is
+necessary, this is a complicated operation in the case of inverse FFT. It is
+implemented by repeatedly loading multiple input values into SIMD registers,
+calculating their absolute values in hardware and then checking if those have
+the second most significant bit set in which case scaling should be performed
+(see lines 417-451 (tie)). The overall performance of this operation is very
+similar to that of decimation in time but since it has to be performed multiple
+times in case of inverse FFT it is slightly more performance critical, thus
+justifying a fast hardware implementation.
+
+The actual butterfly calculations are carried out partly in shared functions.
+The first three (or last three for DIF) loop iterations are unrolled since they
+implement the parallel butterfly operations slightly differently. In these
+iterations, twiddle factors are hardwired and four butterfly operations are
+always carried out in parallel, these four butterflies are shared hardware (see
+e.g. lines 165-175 (asm) and 455-494 (tie)).
+
+The innermost part of the main loop is the most performance critical part of
+the algorithm and needs four additional butterfly structures for a total of
+eight (see lines 150-163 (asm) and 584-655 (tie)). Twiddle factors are
+calculated directly within the main TIE butterfly operation. It would also be
+possible to precalculate the twiddle factors, especially since the same ones
+are frequently reused within the algorithm.  But this would require a
+significant additional number as intermediate storage memory. Because the
+innermost part of the main loop operates slightly differently from the
+reference implementation in order to allow parallel processing of eight
+butterflies in each iteration, twiddle factors can also not easily be reused
+across iterations. Calculating the twiddle factors is in essence mainly a
+lookup operation that uses a hardware table of sine-wave values. An
+optimization was made here by limiting the size of this table to 256 value and
+then providing an appropriate value for all 10 bit indices from 0 to 1023 by
+utilizing additional hardware logic (see lines 85-98 (tie)).
+
+The heavily optimized TIE operation uses up more than 30.000 gates.  Again,
+loads and stores dictate a lower bound on the loops cycle count. Thus, my
+initial approach was to first load 16 complex numbers (512 bit), process them
+in parallel with eight butterflies implemented in a single TIE operation and
+then store the results. With FLIX this could be achieved in only five cycles
+(discounting inevitable branch delay) while also simultaneously updating a loop
+counter with no further overhead.
+
+A further improvement was to introduce a two stage pipeline: The load
+operations load data into four 128 bit processor states (load buffers) in two
+steps while simultaneously with the first step, the old contents of these
+states are processed by the butterfly operations and the results stored into
+four separate 128 bit processor states (store buffers) which are then stored to
+memory. This requires treating the first and last loop iteration separately but
+saves a whole cycle.
+
+Because of the large area overhead of the main butterfly TIE operation, I also
+thought about splitting it into two separate operations consisting of four
+butterflies each. These could be shared with those used in the first three loop
+iterations, resulting in a large area reduction. The same cycle count can be
+achieved with this method by still loading/storing 16 complex numbers per
+iteration, but then operating only on one half of the load buffers in parallel
+with the first load cycle and then one the second half in the second loop
+cycle. This would of course require additional muxing hardware and also four
+additional 128 bit buffer states to prevent the first load cycle from
+overwriting the inputs of the second set of butterfly operations but still
+result in an overall area reduction. This could even be taken one step further
+by using four 128 bit buffer stages and distributing the butterfly operations
+across both the two load and store cycles But this would require an even more
+complicated handling of the first and last iterations and only reduce area
+significantly if the first three loop operations where also handled similarly
+(because otherwise four butterfly instances will need to exist in hardware
+anyway).  In the end I decided against both these approaches because while
+reducing area, they might actually increase the main butterfly TIE operation’s
+critical path because they contain additional muxing logic and can at the same
+time not be internally pipelined because they are always in at least one case
+immediately followed by store operations depending on their results.
+
+So a more area effective approach is purposely not chosen in order to
+facilitate internal pipelining of the in any case very complex main butterfly
+TIE operation whose critical path includes multiple additions and one
+multiplication and would almost certainly constitute a bottleneck for the
+synthesized circuit’s clock frequency (see lines 657-662 (tie)).
+
+Overall I believe that it the implementation given is somewhat close to the
+upper limit achievable in terms of speed (since memory loads and stores form a
+hard lower limit on the total number of clock cycles needed). In an actual
+application it might be ideal to first determine a hard upper bound on the
+speed of the implementation and then optimize for area, More than doubling chip
+area might be too excessive, although this is impossible to say without
+concrete application demands.
+
+If area needs to be reduced I would suggest making the (very large) components
+realising the innermost butterfly loop smaller and less efficient, e.g. by only
+processing four butterflies at a time instead of eight. This would reduce area
+significantly while not killing performance completely.  By working with the
+Xtensa IDE I have learned a lot about hand-optimizing assembly code and the
+pitfalls of compiler optimization as well as how to utilize techniques such as
+SIMD and VLIW. I have also improved my intuition about the relative strengths,
+weaknesses and performance differences between software and hardware
+implementations, seamlessly mixing the two together was an interesting
+experience.
+
+\chapter{Code Listings}
+
+\ 
+
+\captionof{listing}{fft.S}
+\inputminted{text}{../project/source/asm/fft.S}
+
+\captionof{listing}{fft.tie}
+\inputminted{text}{../project/source/tie/fft.tie}
+
+\end{document}
