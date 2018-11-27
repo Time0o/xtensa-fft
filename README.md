@@ -1,3 +1,5 @@
+# TU Dresden _Hardware Software Codesign Lab_ solution
+
 This is an implementation of the Cooley-Tukey FFT algorithm for one of
 Tensilica's Xtensa processor platforms. The Tensilica Instruction Extension
 hardware-description DSL is utilized to customize the core Xtensa core
